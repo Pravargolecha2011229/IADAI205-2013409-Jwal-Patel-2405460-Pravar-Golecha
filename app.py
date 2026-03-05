@@ -1047,7 +1047,7 @@ def show_app():
         pages = [
             ("🏠","Home"),("✈️","Plan Trip"),("🤖","AI Chatbot"),
             ("📊","Dashboard"),("❤️","Favorites"),("⭐","Reviews"),
-            ("💬","Feedback"),("📝","Travel Notes"),("👤","Profile"),("⚙️","Settings")
+            ("💬","Feedback"),("📝","Travel Notes"),("👤","Profile"),("📋","History")
         ]
         nav = st.radio("", [f"{ic} {pg}" for ic,pg in pages], label_visibility="collapsed")
 
@@ -1082,7 +1082,7 @@ def show_app():
     elif page == "Feedback":     page_feedback()
     elif page == "Travel Notes": page_notes()
     elif page == "Profile":      page_profile()
-    elif page == "Settings":     page_settings()
+    elif page == "History":      page_history()
 
 
 # ─────────────────────────────────────────
@@ -1728,77 +1728,118 @@ def page_profile():
 
 
 # ─────────────────────────────────────────
-#  SETTINGS
+#  HISTORY
 # ─────────────────────────────────────────
-def page_settings():
-    st.markdown('<h2 class="sub-header">⚙️ Settings</h2>', unsafe_allow_html=True)
+def page_history():
+    st.markdown('<h2 class="sub-header">📋 Your Travel History</h2>', unsafe_allow_html=True)
 
-    t1,t2,t3 = st.tabs(["🔑 API Key","🌍 Preferences","🔒 Privacy"])
+    t1,t2,t3,t4,t5 = st.tabs(["📝 Itineraries","⭐ Reviews","❤️ Favorites","💬 Chat","📄 Notes"])
 
     with t1:
-        st.markdown("""
-        <div class="tip-box">
-            <strong>🔑 Gemini API Key</strong> — Required for AI itinerary generation and chatbot.
-            Get your free key at <a href="https://makersuite.google.com/app/apikey" target="_blank" style="color:#00d4aa;">Google AI Studio</a>.
-            <br><em>Optional:</em> you can override the model used by setting a secret or
-            environment variable named <code>GEMINI_MODEL</code> (e.g. <code>models/gemini-2.5-pro</code>).
-        </div>
-        """, unsafe_allow_html=True)
-
-        current = st.secrets.get("GEMINI_API_KEY","") if hasattr(st,"secrets") else ""
-        new_key = st.text_input("Gemini API Key", value=current, type="password",
-                                 placeholder="AIza...")
-        st.markdown("""
-        <div style="color:#64748b;font-size:0.85rem;margin-top:0.5rem;">
-        To use a custom key, add it to your <code>.streamlit/secrets.toml</code> file as:<br>
-        <code>GEMINI_API_KEY = "your-key-here"</code>
-        </div>
-        """, unsafe_allow_html=True)
-
-        if st.button("🧪 Test API Connection", type="primary"):
-            model = get_model()
-            if model:
-                try:
-                    r = model.generate_content("Say 'GlobeTrek AI is ready!' in one sentence.")
-                    st.success(f"✅ Connected using {model.name}! {r.text[:100]}")
-                except Exception as e:
-                    error_str = str(e).lower()
-                    if "quota exceeded" in error_str or "429" in error_str:
-                        st.error("❌ Quota exceeded. Upgrade your Gemini plan at [Google AI Studio](https://makersuite.google.com/app/apikey) → Billing.")
-                    else:
-                        st.error(f"❌ API Error: {e}")
+        st.markdown("#### ✈️ Your Past Itineraries")
+        itineraries = get_itineraries(st.session_state.uid)
+        if itineraries:
+            itin_list = []
+            for itin_id, user_id, title, country, itin_data_str, start_date, end_date, budget, group_size, created_at in itineraries:
+                itin_list.append({
+                    '📅 Date Created': created_at[:10] if created_at else 'N/A',
+                    '🌍 Country': country,
+                    '✈️ Trip': title,
+                    '💰 Budget': f"${budget}/day" if budget else 'N/A',
+                    '👥 Group': str(group_size) if group_size else 'N/A'
+                })
+            if itin_list:
+                df_itin = pd.DataFrame(itin_list)
+                st.dataframe(df_itin, use_container_width=True, hide_index=True)
             else:
-                st.error("❌ Could not initialise Gemini model. Check your key and optional GEMINI_MODEL override.")
+                st.info("No itineraries created yet. Start planning a trip!")
+        else:
+            st.info("📭 No itineraries yet. Head to **Plan Trip** to create your first AI itinerary!")
 
     with t2:
-        st.markdown("#### 🌍 Language & Display")
-        lang = st.selectbox("Default Language", list(LANGUAGES.values()), index=0)
-        currency = st.selectbox("Currency", ["USD ($)","EUR (€)","GBP (£)","INR (₹)","JPY (¥)"])
-        units = st.radio("Distance Units", ["Kilometres","Miles"], horizontal=True)
-        if st.button("💾 Save Preferences", type="primary"):
-            st.success("✅ Preferences saved!")
+        st.markdown("#### ⭐ Your Reviews")
+        reviews_list = []
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("SELECT site_name, country, rating, review_text, visit_date, created_at FROM reviews WHERE user_id=? ORDER BY created_at DESC LIMIT 50", (st.session_state.uid,))
+            reviews = c.fetchall()
+            conn.close()
+            
+            if reviews:
+                for site_name, country, rating, review_text, visit_date, created_at in reviews:
+                    reviews_list.append({
+                        '📅 Posted': created_at[:10] if created_at else 'N/A',
+                        '📍 Destination': f"{site_name}, {country}",
+                        '⭐ Rating': f"{'★'*int(rating)}{'☆'*(5-int(rating))}",
+                        '💬 Review': review_text[:60] + '...' if review_text and len(review_text) > 60 else review_text or '(No comment)'
+                    })
+                df_reviews = pd.DataFrame(reviews_list)
+                st.dataframe(df_reviews, use_container_width=True, hide_index=True)
+            else:
+                st.info("📭 No reviews yet. Share your travel experiences!")
+        except:
+            st.info("📭 No reviews yet.")
 
     with t3:
-        st.markdown("#### 🔒 Privacy Controls")
-        st.checkbox("Make my reviews public", True)
-        st.checkbox("Allow usage analytics", True)
-        st.checkbox("Receive travel tips by email", False)
-        st.markdown("<hr class='gt-divider'>", unsafe_allow_html=True)
-        st.markdown("#### ⚠️ Danger Zone")
-        c1,c2 = st.columns(2)
-        with c1:
-            if st.button("📥 Download My Data", use_container_width=True):
-                user_data = {
-                    'profile': get_user(st.session_state.uid),
-                    'favourites': get_favs(st.session_state.uid),
-                    'itineraries': get_itineraries(st.session_state.uid),
-                    'notes': get_notes(st.session_state.uid)
-                }
-                st.download_button("⬇️ Download JSON", json.dumps(user_data, default=str, indent=2),
-                                   "globetrek_data.json","application/json")
-        with c2:
-            if st.button("🗑️ Delete Account", use_container_width=True):
-                st.warning("⚠️ This cannot be undone. Contact support to delete your account.")
+        st.markdown("#### ❤️ Your Saved Favorites")
+        favs = get_favs(st.session_state.uid)
+        if favs:
+            fav_data = []
+            for site_name, country, site_type, rating in favs:
+                fav_data.append({
+                    '📍 Destination': site_name,
+                    '🌍 Country': country,
+                    '🎭 Type': site_type or 'Cultural',
+                    '⭐ Rating': f"{'★'*int(rating)}{'☆'*(5-int(rating))}" if rating else 'N/A'
+                })
+            df_favs = pd.DataFrame(fav_data)
+            st.dataframe(df_favs, use_container_width=True, hide_index=True)
+        else:
+            st.info("❤️ No favorites saved yet. Explore destinations and add them to your favorites!")
+
+    with t4:
+        st.markdown("#### 💬 Chat History")
+        history = get_chat(st.session_state.uid)
+        if history:
+            chat_data = []
+            for role, msg in history[-30:]:
+                chat_data.append({
+                    '👤 Role': '🧑 You' if role == 'user' else '🤖 GlobeBot',
+                    '💬 Message': msg[:80] + '...' if len(msg) > 80 else msg
+                })
+            df_chat = pd.DataFrame(chat_data)
+            st.dataframe(df_chat, use_container_width=True, hide_index=True)
+            
+            if st.button("🗑️ Clear Chat History"):
+                try:
+                    conn = sqlite3.connect(DB_PATH)
+                    conn.execute("DELETE FROM chat_history WHERE user_id=?", (st.session_state.uid,))
+                    conn.commit()
+                    conn.close()
+                    st.success("Chat history cleared!")
+                    st.rerun()
+                except:
+                    st.error("Failed to clear history.")
+        else:
+            st.info("💭 No chat history yet. Start chatting with GlobeBot!")
+
+    with t5:
+        st.markdown("#### 📄 Your Travel Notes")
+        notes = get_notes(st.session_state.uid)
+        if notes:
+            notes_data = []
+            for note_id, user_id, title, content, country, created_at in notes:
+                notes_data.append({
+                    '📅 Date': created_at[:10] if created_at else 'N/A',
+                    '📍 Country': country or '(Multiple)',
+                    '📝 Title': title,
+                    '📋 Preview': content[:60] + '...' if content and len(content) > 60 else content or '(Empty)'
+                })
+            df_notes = pd.DataFrame(notes_data)
+            st.dataframe(df_notes, use_container_width=True, hide_index=True)
+        else:
+            st.info("📝 No travel notes yet. Create notes while planning your trips!")
 
 
 # ─────────────────────────────────────────
