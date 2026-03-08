@@ -6,9 +6,15 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import google.generativeai as genai
 from datetime import datetime, timedelta
-import os, json, html, re, hashlib, sqlite3
+import os, json, html, re, hashlib, sqlite3, uuid
+import requests
 import warnings
 warnings.filterwarnings('ignore')
+try:
+    import matplotlib  # required by pandas Styler.background_gradient
+    HAS_MATPLOTLIB = True
+except Exception:
+    HAS_MATPLOTLIB = False
 
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -19,14 +25,32 @@ except ImportError:
 # ─────────────────────────────────────────
 #  CONFIG
 # ─────────────────────────────────────────
-# Load API key from Streamlit secrets or fall back to environment variable or placeholder.
-try:
-    GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY")
-except FileNotFoundError:
-    # Streamlit can't find a secrets file; fall back to env var or default string
-    GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-    if not GEMINI_API_KEY:
-        st.warning("Gemini API key not found. Please add it to .streamlit/secrets.toml or set GEMINI_API_KEY environment variable.")
+def _secret_value(name):
+    """Safely read from Streamlit secrets in local and cloud environments."""
+    try:
+        return st.secrets.get(name)
+    except Exception:
+        return None
+
+
+# Secrets take precedence, then environment variables.
+GEMINI_API_KEY = _secret_value("GEMINI_API_KEY") or os.environ.get("GEMINI_API_KEY", "")
+GROQ_API_KEY = _secret_value("GROQ_API_KEY") or os.environ.get("GROQ_API_KEY", "")
+GEMINI_MODEL = _secret_value("GEMINI_MODEL") or os.environ.get("GEMINI_MODEL", "") or "models/gemini-2.5-pro"
+GROQ_MODEL = _secret_value("GROQ_MODEL") or os.environ.get("GROQ_MODEL", "") or "llama-3.3-70b-versatile"
+AI_PROVIDER = (_secret_value("AI_PROVIDER") or os.environ.get("AI_PROVIDER", "")).strip().lower()
+
+# Auto-detect Groq keys pasted into Gemini fields.
+if not GROQ_API_KEY and GEMINI_API_KEY.startswith("gsk_"):
+    GROQ_API_KEY = GEMINI_API_KEY
+
+if not AI_PROVIDER:
+    AI_PROVIDER = "groq" if GROQ_API_KEY else "gemini"
+
+if AI_PROVIDER == "groq" and not GROQ_API_KEY:
+    st.warning("Groq API key not found. Add GROQ_API_KEY (or AI_PROVIDER=gemini with GEMINI_API_KEY).")
+if AI_PROVIDER == "gemini" and not GEMINI_API_KEY:
+    st.warning("Gemini API key not found. Add GEMINI_API_KEY (or AI_PROVIDER=groq with GROQ_API_KEY).")
 
 st.set_page_config(
     page_title="GlobeTrek AI – Cultural Travel Planner",
@@ -498,6 +522,12 @@ def init_db():
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
     );
+    CREATE TABLE IF NOT EXISTS user_presence (
+        session_id TEXT PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
     """)
     conn.commit(); conn.close()
 
@@ -649,12 +679,46 @@ def get_chat(uid, limit=20):
         r = c.fetchall(); conn.close(); return list(reversed(r))
     except: return []
 
+def touch_user_presence(uid):
+    try:
+        if not uid:
+            return
+        if "session_id" not in st.session_state or not st.session_state.session_id:
+            st.session_state.session_id = f"{uid}-{uuid.uuid4().hex}"
+        sid = st.session_state.session_id
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("""
+            INSERT INTO user_presence(session_id,user_id,last_seen)
+            VALUES(?,?,CURRENT_TIMESTAMP)
+            ON CONFLICT(session_id) DO UPDATE SET
+              user_id=excluded.user_id,
+              last_seen=CURRENT_TIMESTAMP
+        """, (sid, uid))
+        conn.execute("DELETE FROM user_presence WHERE last_seen < datetime('now','-5 minutes')")
+        conn.commit()
+        conn.close()
+    except:
+        pass
+
+def clear_user_presence():
+    try:
+        sid = st.session_state.get("session_id")
+        if not sid:
+            return
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("DELETE FROM user_presence WHERE session_id=?", (sid,))
+        conn.commit()
+        conn.close()
+    except:
+        pass
+
 def get_stats():
     try:
         conn = sqlite3.connect(DB_PATH); c = conn.cursor()
         stats = {}
         for key, query in [
             ('users',       "SELECT COUNT(*) FROM users"),
+            ('users_online',"SELECT COUNT(DISTINCT user_id) FROM user_presence WHERE last_seen >= datetime('now','-5 minutes')"),
             ('reviews',     "SELECT COUNT(*) FROM reviews"),
             ('avg_rating',  "SELECT COALESCE(AVG(rating),0) FROM reviews"),
             ('itineraries', "SELECT COUNT(*) FROM saved_itineraries"),
@@ -667,7 +731,7 @@ def get_stats():
         c.execute("SELECT country,COUNT(*) FROM saved_itineraries GROUP BY country ORDER BY 2 DESC LIMIT 8")
         stats['pop_countries'] = c.fetchall()
         conn.close(); return stats
-    except: return {'users':0,'reviews':0,'avg_rating':0,'itineraries':0,'feedback':0,'avg_sat':0,'top_reviewed':[],'pop_countries':[]}
+    except: return {'users':0,'users_online':0,'reviews':0,'avg_rating':0,'itineraries':0,'feedback':0,'avg_sat':0,'top_reviewed':[],'pop_countries':[]}
 
 
 # ─────────────────────────────────────────
@@ -748,38 +812,99 @@ def _sample_data():
 #  GEMINI
 # ─────────────────────────────────────────
 @st.cache_resource
-def get_model():
-    """Initialize and return a Gemini model with error handling."""
-    """Return a configured Gemini model instance.
-
-    The application used to request ``gemini-pro`` which is no longer
-    available under the current API version.  We now pick a newer model
-    by default (``models/gemini-2.5-pro``) but allow users to override the
-    choice via the ``GEMINI_MODEL`` environment variable or a secret
-    value named ``GEMINI_MODEL``.  This keeps the UI unchanged while
-    offering flexibility when the model lineup changes.
-    """
+def get_model(provider, api_key, model_name):
+    """Return a configured Gemini model instance."""
     try:
-        genai.configure(api_key=GEMINI_API_KEY)
-        # allow explicit override (secret takes precedence)
-        model_name = None
-        if hasattr(st, 'secrets'):
-            model_name = st.secrets.get("GEMINI_MODEL")
-        if not model_name:
-            model_name = os.environ.get("GEMINI_MODEL")
-        # default to a known good model
-        if not model_name:
-            # use a fast, high-limit model
-            model_name = "models/gemini-2.0-flash"
+        if provider != "gemini":
+            return None
+        if not api_key:
+            return None
+        genai.configure(api_key=api_key)
         return genai.GenerativeModel(model_name)
     except Exception as e:
         # initialization failure; log to console for debugging
         print(f"[GlobeTrek] get_model error: {e}")
         return None
 
+
+def _is_quota_error(error_str):
+    s = (error_str or "").lower()
+    quota_markers = ["quota exceeded", "resource_exhausted", "429", "rate limit", "too many requests"]
+    return any(marker in s for marker in quota_markers)
+
+
+def _groq_generate(prompt, system_prompt="", temperature=0.7, max_tokens=3500):
+    if not GROQ_API_KEY:
+        raise RuntimeError("Missing GROQ_API_KEY")
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt or "You are a helpful travel planning assistant."},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": temperature,
+        "max_tokens": max_tokens
+    }
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    resp = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers=headers,
+        json=payload,
+        timeout=90
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"{resp.status_code} {resp.text[:500]}")
+    data = resp.json()
+    choices = data.get("choices") or []
+    if not choices:
+        raise RuntimeError("Groq returned no choices.")
+    return choices[0].get("message", {}).get("content", "").strip()
+
+
+def _fallback_itinerary(country, interests, budget, group_size, start_date, end_date):
+    days = (end_date - start_date).days + 1
+    total = budget * group_size * days
+    picks = interests if interests else ["Culture", "Food", "History"]
+    lines = [
+        "## Offline Itinerary (Fallback)",
+        "",
+        f"Gemini response is unavailable right now, so here is a practical {days}-day plan for **{country}**.",
+        "",
+        "### Trip Snapshot",
+        f"- Dates: {start_date.strftime('%B %d, %Y')} to {end_date.strftime('%B %d, %Y')}",
+        f"- Group size: {group_size}",
+        f"- Budget: ${budget}/person/day (estimated total: ${total:,.0f})",
+        f"- Focus: {', '.join(picks)}",
+        "",
+        "### Day-by-Day Plan"
+    ]
+    for i in range(days):
+        d = start_date + timedelta(days=i)
+        theme = picks[i % len(picks)]
+        est = max(25, int(budget * 0.9))
+        lines.extend([
+            f"#### Day {i+1} ({d.strftime('%a, %b %d')}): {theme}",
+            "- Morning: Visit a top cultural landmark and arrive at opening time.",
+            "- Afternoon: Explore a museum/local market, then have a regional lunch.",
+            "- Evening: Take a neighborhood walk, local dinner, and cultural show if available.",
+            f"- Estimated spend: ${est} per person",
+            ""
+        ])
+    lines.extend([
+        "### Practical Tips",
+        "- Keep 10-15% of budget as contingency.",
+        "- Use public transport/day passes where possible.",
+        "- Pre-book major attractions for morning slots.",
+        "",
+        "### Next Step",
+        "When Gemini quota resets (midnight UTC) or billing is enabled, regenerate for a fully AI-detailed version."
+    ])
+    return "\n".join(lines)
+
 def gen_itinerary_ai(country, interests, budget, group_size, start_date, end_date):
-    model = get_model()
-    if not model: return None
     days = (end_date - start_date).days + 1
     prompt = f"""You are an expert cultural travel planner. Create an extremely detailed, practical {days}-day itinerary for {group_size} people visiting {country}.
 
@@ -879,6 +1004,16 @@ Organized by category (documents, clothing, electronics, health)
 Make every section detailed, accurate, and genuinely useful. Include specific names of restaurants, hotels, and attractions. Provide real price estimates where possible."""
 
     try:
+        if AI_PROVIDER == "groq":
+            return _groq_generate(
+                prompt,
+                system_prompt="You are an expert cultural travel planner. Return structured markdown with clear sections.",
+                temperature=0.7,
+                max_tokens=6000
+            )
+        model = get_model(AI_PROVIDER, GEMINI_API_KEY, GEMINI_MODEL)
+        if not model:
+            return _fallback_itinerary(country, interests, budget, group_size, start_date, end_date)
         # request as many tokens as the model will allow for long itineraries
         response = model.generate_content(prompt, generation_config=genai.types.GenerationConfig(
             temperature=0.7, max_output_tokens=32768
@@ -898,17 +1033,24 @@ Make every section detailed, accurate, and genuinely useful. Include specific na
     except Exception as e:
         error_str = str(e).lower()
         if "api key" in error_str or "invalid" in error_str or "authentication" in error_str:
-            st.error("❌ **API Key Error**: Your Gemini API key is invalid or not recognized.\n\n**Steps to fix:**\n1. Go to [Google AI Studio](https://makersuite.google.com/app/apikey)\n2. Create a **new** API key\n3. Copy it carefully (no extra spaces)\n4. Replace `GEMINI_API_KEY` in `.streamlit/secrets.toml`\n5. Restart the app")
+            if AI_PROVIDER == "groq":
+                st.error("❌ **API Key Error**: Your Groq API key is invalid or not recognized.\n\nUpdate `GROQ_API_KEY` in `secrets.toml` and restart the app.")
+            else:
+                st.error("❌ **API Key Error**: Your Gemini API key is invalid or not recognized.\n\n**Steps to fix:**\n1. Go to [Google AI Studio](https://makersuite.google.com/app/apikey)\n2. Create a **new** API key\n3. Copy it carefully (no extra spaces)\n4. Replace `GEMINI_API_KEY` in `.streamlit/secrets.toml`\n5. Restart the app")
             return None
-        elif "quota exceeded" in error_str or "429" in error_str:
-            st.error("❌ **Quota Exceeded**: Your API key's free tier limit has been reached.\n\n**To continue:**\n1. Go to [Google Cloud Console](https://console.cloud.google.com/)\n2. Enable **Billing** for your project\n3. Return to [Google AI Studio](https://makersuite.google.com/app/apikey) and verify billing is active\n4. Restart the app\n\n(Free tier resets daily at midnight UTC)")
-            return None
-        return f"**API Error:** {str(e)}\n\nPlease check your Gemini API key in the settings or override the model name via the GEMINI_MODEL env/secret."
+        elif _is_quota_error(error_str):
+            if AI_PROVIDER == "groq":
+                st.error("❌ **Quota Exceeded**: Your Groq key hit rate/quota limits. Upgrade your Groq plan or wait for reset.")
+                st.warning("Showing fallback itinerary because Groq quota is currently exhausted.")
+            else:
+                st.error("❌ **Quota Exceeded**: Your API key's free tier limit has been reached.\n\n**To continue:**\n1. Go to [Google Cloud Console](https://console.cloud.google.com/)\n2. Enable **Billing** for your project\n3. Return to [Google AI Studio](https://makersuite.google.com/app/apikey) and verify billing is active\n4. Restart the app\n\n(Free tier resets daily at midnight UTC)")
+                st.warning("Showing fallback itinerary because Gemini quota is currently exhausted.")
+            return _fallback_itinerary(country, interests, budget, group_size, start_date, end_date)
+        st.warning("Showing fallback itinerary because Gemini is temporarily unavailable.")
+        return _fallback_itinerary(country, interests, budget, group_size, start_date, end_date)
 
 
 def ask_chatbot(question, context="", history=None):
-    model = get_model()
-    if not model: return "Chatbot unavailable — Gemini API not configured."
     sys_prompt = f"""You are GlobeBot, a friendly and knowledgeable cultural travel assistant for GlobeTrek AI.
 Help users with travel planning, cultural insights, visa info, packing tips, safety advice, and destination recommendations.
 Be concise, friendly, and use emojis appropriately. Context: {context}"""
@@ -918,12 +1060,30 @@ Be concise, friendly, and use emojis appropriately. Context: {context}"""
             messages.append({'role': role, 'parts': [msg]})
     messages.append({'role': 'user', 'parts': [question]})
     try:
+        if AI_PROVIDER == "groq":
+            return _groq_generate(
+                question,
+                system_prompt=sys_prompt,
+                temperature=0.6,
+                max_tokens=1200
+            )
+        model = get_model(AI_PROVIDER, GEMINI_API_KEY, GEMINI_MODEL)
+        if not model:
+            return "Chatbot unavailable — Gemini API not configured."
         chat = model.start_chat(history=messages[:-1])
         resp = chat.send_message(sys_prompt + "\n\n" + question)
         return resp.text
     except Exception as e:
         error_str = str(e).lower()
         if "quota exceeded" in error_str or "429" in error_str:
+            if AI_PROVIDER == "groq":
+                return """**Quota Exceeded Error**
+
+Your Groq API key has reached rate/quota limits.
+
+1. Check your Groq dashboard usage and limits.
+2. Upgrade your plan or wait for the reset window.
+3. Retry after a short delay for burst-rate limits."""
             return """**Quota Exceeded Error**
 
 Your free Gemini API tier has reached its limit. To continue using AI features:
@@ -936,12 +1096,20 @@ Once upgraded, you can generate unlimited itineraries! 🚀"""
         return f"Sorry, I encountered an error: {str(e)}"
 
 def gen_destination_insight(site, country, site_type):
-    model = get_model()
-    if not model: return "AI insights unavailable."
     prompt = f"""Give a rich, engaging cultural insight about {site} in {country} (type: {site_type}).
 Include: historical background (2-3 sentences), what makes it unique, best photo spots, insider tips, and nearby attractions.
 Keep it under 250 words. Use emojis and markdown."""
     try:
+        if AI_PROVIDER == "groq":
+            return _groq_generate(
+                prompt,
+                system_prompt="You are a concise, engaging travel expert.",
+                temperature=0.7,
+                max_tokens=450
+            )
+        model = get_model(AI_PROVIDER, GEMINI_API_KEY, GEMINI_MODEL)
+        if not model:
+            return "AI insights unavailable."
         resp = model.generate_content(prompt)
         return resp.text
     except: 
@@ -1047,6 +1215,7 @@ def show_register():
 # ─────────────────────────────────────────
 def show_app():
     df = load_data()
+    touch_user_presence(st.session_state.uid)
 
     # ── Sidebar ──────────────────────────
     with st.sidebar:
@@ -1061,8 +1230,8 @@ def show_app():
         """, unsafe_allow_html=True)
 
         pages = [
-            ("🏠","Home"),("✈️","Plan Trip"),("🤖","AI Chatbot"),
-            ("📊","Dashboard"),("❤️","Favorites"),("⭐","Reviews"),
+            ("🏠","Dashboard"),("✈️","Plan Trip"),("🤖","AI Chatbot"),
+            ("❤️","Favorites"),("⭐","Reviews"),
             ("💬","Feedback"),("📝","Travel Notes"),("👤","Profile"),("📋","History")
         ]
         nav = st.radio("", [f"{ic} {pg}" for ic,pg in pages], label_visibility="collapsed")
@@ -1073,6 +1242,7 @@ def show_app():
         with c2: st.metric("🗺️ Ctrs",  df['country'].nunique())
         st.markdown("<hr style='border-color:#1e3a5f;margin:1rem 0'>", unsafe_allow_html=True)
         if st.button("🚪 Logout", use_container_width=True):
+            clear_user_presence()
             for k in ['uid','uname','fname']: st.session_state[k] = None
             st.session_state.page = 'login'; st.rerun()
 
@@ -1089,10 +1259,9 @@ def show_app():
 
     # ── Route ────────────────────────────
     page = nav.split(" ",1)[1]
-    if   page == "Home":         page_home(df)
+    if   page == "Dashboard":    page_home(df)
     elif page == "Plan Trip":    page_plan(df)
     elif page == "AI Chatbot":   page_chatbot()
-    elif page == "Dashboard":    page_dashboard(df)
     elif page == "Favorites":    page_favorites()
     elif page == "Reviews":      page_reviews(df)
     elif page == "Feedback":     page_feedback()
@@ -1139,21 +1308,83 @@ def page_home(df):
 
     stats = get_stats()
     c1,c2,c3,c4,c5 = st.columns(5)
-    c1.metric("👥 Users",      stats['users'])
+    c1.metric("👥 Users Online", stats.get('users_online', 0))
     c2.metric("📝 Reviews",    stats['reviews'])
     c3.metric("✈️ Trips",      stats['itineraries'])
     c4.metric("💬 Feedback",   stats['feedback'])
     c5.metric("⭐ Avg Rating", f"{stats['avg_rating']:.1f}/5" if stats['avg_rating'] else "—")
 
     st.markdown("<hr class='gt-divider'>", unsafe_allow_html=True)
-    st.markdown('<h2 class="sub-header">🗺️ Explore by Region</h2>', unsafe_allow_html=True)
+    st.markdown('<h2 class="sub-header">👨‍👩‍👧‍👦 Age-Wise Travel Suggestions</h2>', unsafe_allow_html=True)
+    a1, a2, a3 = st.columns(3)
+    with a1:
+        st.markdown("""
+        <div class="gt-card">
+            <h4>🧒 Kids & Teens (8-17)</h4>
+            <p><strong>Best picks:</strong> Theme culture parks, interactive museums, easy nature trails.</p>
+            <p><strong>Why:</strong> Short attention spans need high-energy, visual, activity-based experiences.</p>
+        </div>
+        """, unsafe_allow_html=True)
+    with a2:
+        st.markdown("""
+        <div class="gt-card">
+            <h4>🧑 Young Adults (18-35)</h4>
+            <p><strong>Best picks:</strong> Food trails, heritage walks, nightlife districts, photo hotspots.</p>
+            <p><strong>Why:</strong> Flexible schedules and social travel style fit mixed culture + adventure plans.</p>
+        </div>
+        """, unsafe_allow_html=True)
+    with a3:
+        st.markdown("""
+        <div class="gt-card">
+            <h4>👴 Adults & Seniors (36+)</h4>
+            <p><strong>Best picks:</strong> Relaxed cultural circuits, comfort stays, guided tours, spiritual sites.</p>
+            <p><strong>Why:</strong> Prioritizes pace, safety, comfort, and deeper context over rushed checklists.</p>
+        </div>
+        """, unsafe_allow_html=True)
 
-    # Country distribution table
-    st.markdown("#### 🌍 Top Destinations by Country")
-    country_counts = df['country'].value_counts().head(12).reset_index()
+    st.markdown('<h2 class="sub-header">✨ Why Choose GlobeTrek AI?</h2>', unsafe_allow_html=True)
+    st.markdown("""
+    <div class="gt-card">
+        <p>GlobeTrek AI transforms the way you explore the world by combining artificial intelligence with cultural discovery. Instead of generic travel plans, the platform creates personalized journeys tailored to your interests, budget, and travel style. With real-time insights, curated destinations, and smart recommendations, GlobeTrek AI helps travelers uncover hidden gems and authentic cultural experiences around the globe.</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown("""
+    <div class="gt-card">
+        <h4>What You Get</h4>
+        <p><strong>AI-Powered Trip Planning</strong> – Instantly generate personalized travel itineraries based on your preferences.</p>
+        <p><strong>Cultural Discovery</strong> – Explore destinations rich in history, traditions, and local experiences.</p>
+        <p><strong>Smart Recommendations</strong> – Get suggestions for places, seasons, and activities that match your travel style.</p>
+        <p><strong>Community Insights</strong> – Read reviews and feedback from other travelers to make informed decisions.</p>
+        <p><strong>Travel Organization Tools</strong> – Save favorites, write travel notes, and track your journey in one place.</p>
+        <p><strong>Multilingual Support</strong> – Easily plan trips across countries without language barriers.</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown("""
+    <div class="gt-card">
+        <h4>What Makes Us Unique</h4>
+        <p><strong>AI-Driven Personalization</strong> – Every recommendation adapts to your interests and past activity.</p>
+        <p><strong>Focus on Cultural Exploration</strong> – Not just tourist spots, but meaningful cultural experiences.</p>
+        <p><strong>Integrated Travel Hub</strong> – Planning, recommendations, notes, reviews, and favorites all in one platform.</p>
+        <p><strong>Hidden Gem Discovery</strong> – Discover lesser-known destinations that typical travel platforms miss.</p>
+        <p><strong>User-Centered Design</strong> – A simple, intuitive dashboard designed to make trip planning effortless.</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown("#### 🌍 Popular Countries Snapshot")
+    country_counts = df['country'].value_counts().head(10).reset_index()
     country_counts.columns = ['Country', 'Destinations']
-    country_counts['Percentage'] = (country_counts['Destinations'] / len(df) * 100).round(1)
-    st.dataframe(country_counts, use_container_width=True, hide_index=True)
+    fig_country = px.bar(
+        country_counts.sort_values('Destinations'),
+        x='Destinations',
+        y='Country',
+        orientation='h',
+        color='Destinations',
+        color_continuous_scale='Tealgrn'
+    )
+    fig_country.update_layout(height=380, margin=dict(l=10, r=10, t=10, b=10), coloraxis_showscale=False)
+    st.plotly_chart(fig_country, use_container_width=True)
 
     st.markdown("<hr class='gt-divider'>", unsafe_allow_html=True)
     st.markdown('<h2 class="sub-header">🔍 Destination Explorer</h2>', unsafe_allow_html=True)
@@ -1325,7 +1556,7 @@ def page_plan(df):
                 if st.button("🤖 Ask Follow-up Questions", use_container_width=True):
                     st.info("Head to the AI Chatbot tab to ask follow-up questions about your itinerary!")
         else:
-            st.error("Could not generate itinerary. Please check your API key in Settings.")
+            st.error("Could not generate itinerary. Check your Gemini API key, billing/quota status, and optional `GEMINI_MODEL` override in secrets/env.")
 
 
 # ─────────────────────────────────────────
@@ -1390,7 +1621,7 @@ def page_dashboard(df):
 
     stats = get_stats()
     c1,c2,c3,c4,c5,c6 = st.columns(6)
-    c1.metric("👥 Users",       stats['users'])
+    c1.metric("👥 Users Online", stats.get('users_online', 0))
     c2.metric("📝 Reviews",     stats['reviews'])
     c3.metric("✈️ Itineraries", stats['itineraries'])
     c4.metric("💬 Feedback",    stats['feedback'])
@@ -1399,12 +1630,11 @@ def page_dashboard(df):
 
     st.markdown("<hr class='gt-divider'>", unsafe_allow_html=True)
 
-    t1,t2,t3,t4 = st.tabs(["📊 Destinations","🗺️ Map View","🌡️ Season Analysis","👥 Community"])
+    t1,t2,t3 = st.tabs(["📊 Destinations","🌡️ Season Analysis","👥 Community"])
 
     with t1:
         c1,c2 = st.columns(2)
         with c1:
-            # Rating distribution table
             st.markdown("#### ⭐ Rating Distribution")
             rating_dist = pd.cut(df['rating'], bins=[0,1,2,3,4,5], labels=['1★', '2★', '3★', '4★', '5★']).value_counts().sort_index()
             rating_table = pd.DataFrame({
@@ -1412,15 +1642,18 @@ def page_dashboard(df):
                 'Count': rating_dist.values,
                 'Percentage': (rating_dist.values / len(df) * 100).round(1)
             }).reset_index(drop=True)
-            st.dataframe(rating_table, use_container_width=True, hide_index=True)
+            fig_rating = px.bar(rating_table, x='Rating Range', y='Count', text='Count', color='Count', color_continuous_scale='Blues')
+            fig_rating.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10), coloraxis_showscale=False)
+            st.plotly_chart(fig_rating, use_container_width=True)
 
         with c2:
-            # Site type distribution table
             st.markdown("#### 🏛️ Destination Types Breakdown")
             type_counts = df['site_type'].value_counts().reset_index()
             type_counts.columns = ['Type', 'Count']
             type_counts['Percentage'] = (type_counts['Count'] / len(df) * 100).round(1)
-            st.dataframe(type_counts, use_container_width=True, hide_index=True)
+            fig_type = px.pie(type_counts.head(8), names='Type', values='Count', hole=0.45)
+            fig_type.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10))
+            st.plotly_chart(fig_type, use_container_width=True)
 
         # Budget vs Rating table
         st.markdown("#### 💰 Budget vs Rating by Destination Type")
@@ -1434,42 +1667,34 @@ def page_dashboard(df):
         st.dataframe(budget_rating, use_container_width=True, hide_index=True)
 
     with t2:
-        st.markdown("#### 🌍 Destinations by Country")
-        country_summary = df.groupby('country').agg({
-            'site_name': 'count',
-            'rating': 'mean',
-            'budget_per_day': 'mean'
-        }).round(2).reset_index()
-        country_summary.columns = ['Country', 'Destinations', 'Avg Rating', 'Avg Daily Budget ($)']
-        country_summary = country_summary.sort_values('Destinations', ascending=False)
-        st.dataframe(country_summary, use_container_width=True, hide_index=True)
-        
-        st.markdown("#### 📍 Top Destinations Globally")
-        top_dests = df.nlargest(15, 'rating')[['site_name', 'country', 'site_type', 'rating', 'budget_per_day']].reset_index(drop=True)
-        top_dests.columns = ['Destination', 'Country', 'Type', 'Rating', 'Daily Budget ($)']
-        st.dataframe(top_dests, use_container_width=True, hide_index=True)
-
-    with t3:
         st.markdown("#### 🌡️ Best Season Analysis")
         season_counts = df['best_season'].value_counts().reset_index().head(10)
         season_counts.columns = ['Season', 'Count']
         season_counts['Percentage'] = (season_counts['Count'] / len(df) * 100).round(1)
         season_counts = season_counts.sort_values('Count', ascending=False)
-        st.dataframe(season_counts, use_container_width=True, hide_index=True)
+        fig_season = px.bar(season_counts, x='Season', y='Count', text='Count', color='Count', color_continuous_scale='Teal')
+        fig_season.update_layout(height=340, margin=dict(l=10, r=10, t=10, b=10), coloraxis_showscale=False)
+        st.plotly_chart(fig_season, use_container_width=True)
 
         # Top 10 budget destinations
         st.markdown("#### 💚 Most Budget-Friendly Destinations")
         cheap = df.nsmallest(10,'budget_per_day')[['site_name','country','site_type','budget_per_day','rating']].reset_index(drop=True)
         cheap.columns = ['Destination', 'Country', 'Type', 'Daily Budget ($)', 'Rating']
-        st.dataframe(cheap.style.background_gradient(cmap='YlOrRd', subset=['Daily Budget ($)']),
-                     use_container_width=True, hide_index=True)
+        if HAS_MATPLOTLIB:
+            st.dataframe(
+                cheap.style.background_gradient(cmap='YlOrRd', subset=['Daily Budget ($)']),
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.dataframe(cheap, use_container_width=True, hide_index=True)
         
         st.markdown("#### ⭐ Highest Rated Destinations")
         top_rated = df.nlargest(10,'rating')[['site_name','country','site_type','rating','budget_per_day']].reset_index(drop=True)
         top_rated.columns = ['Destination', 'Country', 'Type', 'Rating', 'Daily Budget ($)']
         st.dataframe(top_rated, use_container_width=True, hide_index=True)
 
-    with t4:
+    with t3:
         stats2 = get_stats()
         if stats2['top_reviewed']:
             st.markdown("#### 🔥 Most Reviewed Destinations (by Users)")
@@ -1484,7 +1709,9 @@ def page_dashboard(df):
             pc_df = pd.DataFrame(stats2['pop_countries'], columns=['Country','Itineraries'])
             pc_df = pc_df.sort_values('Itineraries', ascending=False)
             pc_df['Percentage'] = (pc_df['Itineraries'] / pc_df['Itineraries'].sum() * 100).round(1)
-            st.dataframe(pc_df, use_container_width=True, hide_index=True)
+            fig_pc = px.bar(pc_df, x='Country', y='Itineraries', text='Itineraries', color='Itineraries', color_continuous_scale='Viridis')
+            fig_pc.update_layout(height=330, margin=dict(l=10, r=10, t=10, b=10), coloraxis_showscale=False)
+            st.plotly_chart(fig_pc, use_container_width=True)
 
 
 # ─────────────────────────────────────────
@@ -1756,13 +1983,13 @@ def page_history():
         itineraries = get_itineraries(st.session_state.uid)
         if itineraries:
             itin_list = []
-            for itin_id, user_id, title, country, itin_data_str, start_date, end_date, budget, group_size, created_at in itineraries:
+            for itin_id, title, country, start_date, end_date, budget, created_at in itineraries:
                 itin_list.append({
                     '📅 Date Created': created_at[:10] if created_at else 'N/A',
                     '🌍 Country': country,
                     '✈️ Trip': title,
                     '💰 Budget': f"${budget}/day" if budget else 'N/A',
-                    '👥 Group': str(group_size) if group_size else 'N/A'
+                    '👥 Group': 'Saved'
                 })
             if itin_list:
                 df_itin = pd.DataFrame(itin_list)
@@ -1845,7 +2072,7 @@ def page_history():
         notes = get_notes(st.session_state.uid)
         if notes:
             notes_data = []
-            for note_id, user_id, title, content, country, created_at in notes:
+            for note_id, title, content, country, created_at in notes:
                 notes_data.append({
                     '📅 Date': created_at[:10] if created_at else 'N/A',
                     '📍 Country': country or '(Multiple)',
