@@ -16,7 +16,7 @@ Travel planning is an exciting but often complex process. While the internet pro
 
 GlobeTrek AI is designed to address this challenge. It is an AI-powered travel planning platform that simplifies the process of discovering destinations, generating personalized itineraries, managing trip information, and engaging with community feedback. The system integrates artificial intelligence, persistent data storage, and an intuitive user interface to create a complete travel planning ecosystem.
 
-Built using Streamlit for the user interface, SQLite for data management, and the Gemini AI model for intelligent itinerary generation, GlobeTrek AI demonstrates how modern AI technologies can enhance user experience in travel planning. The platform focuses on cultural exploration, personalized recommendations, and efficient organization of travel-related information.
+Built using Streamlit for the user interface, SQLite for data management, and the Grok AI model for intelligent itinerary generation, GlobeTrek AI demonstrates how modern AI technologies can enhance user experience in travel planning. The platform focuses on cultural exploration, personalized recommendations, and efficient organization of travel-related information.
 
 The goal of this project is to create a user-centric digital assistant that helps travelers transform scattered research into a structured and meaningful travel plan.
 
@@ -135,11 +135,11 @@ SQLite is used as the local database system to store user accounts, saved itiner
 
 #### 4. Artificial Intelligence
 
-Google's Gemini AI model is used for generating travel itineraries and providing conversational responses through the travel chatbot.
+Grok AI model is used for generating travel itineraries and providing conversational responses through the travel chatbot.
 
 #### 5. API Integration
 
-The application integrates the Gemini API using an API key stored securely in the Streamlit secrets configuration.
+The application integrates the Grok API using an API key stored securely in the Streamlit secrets configuration.
 
 
 ## 7. Application Features
@@ -163,7 +163,7 @@ Users provide information such as:
 * Group size
 * Cultural interests
 
-The system converts this information into a structured prompt and sends it to the Gemini AI model. The AI then generates a detailed travel itinerary that includes recommended activities, cultural experiences, and travel suggestions.
+The system converts this information into a structured prompt and sends it to the Grok AI model. The AI then generates a detailed travel itinerary that includes recommended activities, cultural experiences, and travel suggestions.
 
 Users can save generated itineraries to their personal travel history.
 
@@ -278,7 +278,7 @@ The application constructs a structured prompt based on the user input.
 
 #### Step 4: AI Processing
 
-The prompt is sent to the Gemini AI model using the API key.
+The prompt is sent to the Grok AI model using the API key.
 
 #### Step 5: Itinerary Generation
 
