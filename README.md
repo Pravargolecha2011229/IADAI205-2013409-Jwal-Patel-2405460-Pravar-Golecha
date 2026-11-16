@@ -6,7 +6,7 @@ Made by Pravar Golecha & Jwal Patel
 ## Live Application
 
 The application is publicly accessible at:
-[https://capestone-2-by-pravar-and-jwal-globetreck.streamlit.app/](https://capestone-2-by-pravar-and-jwal-globetreck.streamlit.app/)
+[https://capestone-2-by-pravar-and-jwal-globetreck.streamlit.app/](https://capestone-2-globetreck.streamlit.app/)
 
 
 
